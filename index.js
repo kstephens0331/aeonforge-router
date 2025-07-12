@@ -1,8 +1,8 @@
-const express = require('express');
-const dotenv = require('dotenv');
-const { Octokit } = require('@octokit/rest');
-const { createClient } = require('@supabase/supabase-js');
-const OpenAI = require('openai');
+import express from 'express';
+import dotenv from 'dotenv';
+import OpenAI from 'openai';
+import { Octokit } from '@octokit/rest';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 const app = express();
