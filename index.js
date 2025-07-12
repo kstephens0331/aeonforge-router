@@ -8,13 +8,24 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ✅ DEBUG: Log env vars
-console.log('[DEBUG] SUPABASE_URL:', process.env.SUPABASE_URL);
-console.log('[DEBUG] SUPABASE_SERVICE_KEY (first 10 chars):', process.env.SUPABASE_SERVICE_KEY?.slice(0, 10));
+app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
+
+// 🧠 Secure AI route
+app.post('/api/ask', async (req, res) => {
+  try {
+    const { messages, model = 'gpt-4' } = req.body;
+    const completion = await openai.chat.completions.create({ model, messages });
+    const content = completion.choices[0].message.content;
+    res.json({ result: content });
+  } catch (error) {
+    console.error('❌ OpenAI error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.get('/process', async (req, res) => {
   try {
