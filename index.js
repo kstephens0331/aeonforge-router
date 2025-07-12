@@ -8,6 +8,10 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// ✅ DEBUG: Log env vars
+console.log('[DEBUG] SUPABASE_URL:', process.env.SUPABASE_URL);
+console.log('[DEBUG] SUPABASE_SERVICE_KEY (first 10 chars):', process.env.SUPABASE_SERVICE_KEY?.slice(0, 10));
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
@@ -50,7 +54,7 @@ app.get('/process', async (req, res) => {
 
     res.send(`✅ File committed: ${filePath}`);
   } catch (err) {
-    console.error(err);
+    console.error('❌ Error during /process:', err);
     res.status(500).send('❌ Error processing request');
   }
 });
