@@ -1,79 +1,194 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import OpenAI from 'openai';
-import { Octokit } from '@octokit/rest';
 import { createClient } from '@supabase/supabase-js';
+import { OpenAI } from 'openai';
+import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
+import cors from 'cors';
 
 dotenv.config();
 const app = express();
-const port = process.env.PORT || 3000;
-
 app.use(express.json());
+app.use(cors());
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
+// 🧠 Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-// 🧠 Secure AI route
-app.post('/api/ask', async (req, res) => {
-  try {
-    const { messages, model = 'gpt-4' } = req.body;
-    const completion = await openai.chat.completions.create({ model, messages });
-    const content = completion.choices[0].message.content;
-    res.json({ result: content });
-  } catch (error) {
-    console.error('❌ OpenAI error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/process', async (req, res) => {
-  try {
-    const { data: requests } = await supabase
-      .from('requests')
-      .select('*')
-      .eq('status', 'pending')
-      .limit(1);
-
-    if (!requests.length) return res.send('No pending requests');
-
-    const request = requests[0];
-    const prompt = `Write a clean, production-grade React component or layout for this: ${request.prompt}`;
-
-    const aiResponse = await openai.chat.completions.create({
-      model: 'gpt-4',
-      messages: [{ role: 'user', content: prompt }],
-    });
-
-    const code = aiResponse.choices[0].message.content;
-    const fileName = slugify(request.prompt) + '.jsx';
-    const filePath = `src/generated/${fileName}`;
-
-    await octokit.repos.createOrUpdateFileContents({
-      owner: process.env.GITHUB_USER,
-      repo: process.env.GITHUB_REPO,
-      path: filePath,
-      message: `🧠 Auto-generated: ${request.prompt}`,
-      content: Buffer.from(code).toString('base64'),
-      branch: 'main',
-    });
-
-    await supabase
-      .from('requests')
-      .update({ status: 'done', output: filePath })
-      .eq('id', request.id);
-
-    res.send(`✅ File committed: ${filePath}`);
-  } catch (err) {
-    console.error('❌ Error during /process:', err);
-    res.status(500).send('❌ Error processing request');
-  }
-});
-
-function slugify(text) {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+// 🧠 Smart model routing
+async function getOverrideModel(project_id) {
+  if (!project_id) return null;
+  const { data } = await supabase
+    .from('model_overrides')
+    .select('model')
+    .eq('project_id', project_id)
+    .single();
+  return data?.model || null;
 }
 
-app.listen(port, () => {
-  console.log(`🧠 Router listening on port ${port}`);
+async function getTopRankedModel() {
+  const { data } = await supabase.rpc('get_model_rankings');
+  return data?.[0]?.model || 'gpt-4';
+}
+
+async function determineModel(userSelected, project_id) {
+  if (userSelected) return userSelected;
+  const override = await getOverrideModel(project_id);
+  if (override) return override;
+  return await getTopRankedModel();
+}
+
+// 🧠 Model-specific call handlers
+async function callOpenAI(messages) {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const res = await openai.chat.completions.create({
+    model: 'gpt-4',
+    messages,
+  });
+  return res.choices?.[0]?.message?.content || 'No response';
+}
+
+async function callClaude(messages) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.CLAUDE_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-3-opus-20240229',
+      max_tokens: 1024,
+      messages,
+    }),
+  });
+  const data = await res.json();
+  return data?.content?.[0]?.text || 'Claude returned nothing';
+}
+
+async function callGemini(messages) {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: messages[messages.length - 1]?.content }] }],
+    }),
+  });
+  const json = await res.json();
+  return json?.candidates?.[0]?.content?.parts?.[0]?.text || 'Gemini returned nothing';
+}
+
+async function callMistral(messages) {
+  const prompt = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n');
+  const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.MISTRAL_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'mistral-tiny',
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+  const data = await res.json();
+  return data?.choices?.[0]?.message?.content || 'Mistral returned nothing';
+}
+
+// 🔥 AI Completion Endpoint
+app.post('/api/ask', async (req, res) => {
+  try {
+    const {
+      messages,
+      model,
+      project_id,
+      chat_id,
+      saveToFile = false,
+      filename = '',
+    } = req.body;
+
+    const selectedModel = await determineModel(model, project_id);
+    let output = '';
+
+    if (selectedModel.includes('gpt')) output = await callOpenAI(messages);
+    else if (selectedModel.includes('claude')) output = await callClaude(messages);
+    else if (selectedModel.includes('gemini')) output = await callGemini(messages);
+    else if (selectedModel.includes('mistral')) output = await callMistral(messages);
+    else output = '[Error] No model matched.';
+
+    // 🧠 Save memory (chat_id + project_id)
+    if (chat_id && output) {
+      const combined = `${messages[messages.length - 1]?.content || ''}\n---\n${output}`;
+      await supabase.from('memory').insert([{
+        chat_id,
+        project_id: project_id || null,
+        content: combined,
+      }]);
+    }
+
+    // 💾 Optional file saving
+    if (saveToFile && filename) {
+      const dir = path.join(process.cwd(), 'output');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+      fs.writeFileSync(path.join(dir, filename), output);
+
+      await supabase.from('files').insert([{
+        project_id,
+        filename,
+        path: `/output/${filename}`,
+        description: 'Generated by AI router',
+      }]);
+    }
+
+    return res.json({ output, model: selectedModel });
+  } catch (err) {
+    console.error('🔥 AI Error:', err);
+    return res.status(500).json({ error: 'Failed to process request.' });
+  }
+});
+
+// 📁 File Builder API (manual or triggered by frontend)
+app.post('/api/create-file', async (req, res) => {
+  try {
+    const {
+      content,
+      filename,
+      folder = 'output',
+      saveToSupabase = false,
+      project_id,
+      description,
+    } = req.body;
+
+    if (!content || !filename) return res.status(400).json({ error: 'Missing content or filename.' });
+
+    const dirPath = path.join(process.cwd(), folder);
+    if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+
+    const filePath = path.join(dirPath, filename);
+    fs.writeFileSync(filePath, content);
+
+    if (saveToSupabase) {
+      await supabase.from('files').insert([{
+        project_id,
+        filename,
+        path: `/${folder}/${filename}`,
+        description,
+      }]);
+    }
+
+    return res.json({ success: true, path: `/${folder}/${filename}` });
+  } catch (err) {
+    console.error('🛠️ File creation failed:', err);
+    return res.status(500).json({ error: 'File creation failed.' });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 Router running on port ${PORT}`);
 });
